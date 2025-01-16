@@ -26,49 +26,153 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// Function to Upload File to Cloudinary
+const uploadToCloudinary = async (filePath, folder) => {
+    const result = await cloudinary.uploader.upload(filePath, {
+        folder,
+        resource_type: "image"
+    });
+    fs.unlinkSync(filePath); 
+    return result.secure_url;
+};
+
+// Function to Upload URL to Cloudinary (for artwork & images)
+const uploadUrlToCloudinary = async (url, folder) => {
+    if (url.includes("cloudinary")) return url;
+    const result = await cloudinary.uploader.upload(url, { 
+        folder,
+        resource_type: "image" 
+    });
+    return result.secure_url;
+};
+
+// Function to Upload Audio Files to Cloudinary
+const uploadAudioToCloudinary = async (filePath) => {
+    const result = await cloudinary.uploader.upload(filePath, {
+        resource_type: "video",
+        folder: "audio"
+    })
+    fs.unlinkSync(filePath);
+    return result.secure_url;
+}
+
+// Function to Upload Audio URL to Cloudinary
+const uploadAudioUrlToCloudinary = async (url) => {
+    if (url.includes("cloudinary")) return url;
+    const result = await cloudinary.uploader.upload(url, {
+        resource_type: "video",
+        folder: "audio"
+    });
+    return result.secure_url;
+};
 
 // Add Song
 router.post("/song/add", upload.single("file"), async (req, res) => {
     try {
-        const { name, singer, language, playlist } = req.body;
-
-        let singerDoc = await Singer.findOne({ name: { $regex: new RegExp("^" + singer.trim() + "$", "i") } });
-        if (!singerDoc) {
-            singerDoc = new Singer({ name: singer.trim() });
-            await singerDoc.save();
-        }
-
-
-        let playlistDoc = await Playlist.findOne({ name: { $regex: new RegExp("^" + playlist + "$", "i") } });
-        if (!playlistDoc) {
-            playlistDoc = new Playlist({ name: playlist });
-            await playlistDoc.save();
-        }
+        const songsData = req.body;
         
-        const result = await cloudinary.uploader.upload(req.file.path, { resource_type: "auto" });
+        if (!Array.isArray(songsData)) {
+            return res.status(400).json({ error: "Input must be an array of songs" });
+        }
 
-        const newSong = new Song({
-            name,
-            singer: singerDoc._id,
-            language,
-            playlist: playlistDoc._id,
-            fileLink: result.secure_url
+        const importedSongs = [];
+
+        for (const songData of songsData) {
+
+            // Upload Song File
+            // let fileLink = songData.url; 
+            let fileLink;
+            if (req.file) {
+                fileLink = await uploadAudioToCloudinary(req.file.path);
+            } else if (songData.url) {
+                fileLink = await uploadAudioUrlToCloudinary(songData.url);
+            } else {
+                continue; // Skip if no audio source
+            }
+
+            // Upload Song Artwork
+            let artworkUrl = await uploadUrlToCloudinary(songData.artwork, "artworks");
+            
+            // Find or create singer
+            let singer = await Singer.findOne({ 
+                name: { $regex: new RegExp(`^${songData.artist}$`, "i") }
+            });
+            
+            if (!singer) {
+                let pictureUrl = await uploadUrlToCloudinary(songData.artwork, "singers");
+                singer = new Singer({ 
+                    name: songData.artist,
+                    picture: pictureUrl
+                });
+                await singer.save();
+            }
+
+            // Process playlists
+            const playlistIds = [];
+            for (const playlistName of songData.playlist) {
+                let playlist = await Playlist.findOne({
+                    name: { $regex: new RegExp(`^${playlistName}$`, "i") }
+                });
+
+                if (!playlist) {
+                    let coverImageUrl = await uploadUrlToCloudinary(songData.artwork, "playlists");
+                    playlist = new Playlist({ 
+                        name: playlistName,
+                        coverImage: coverImageUrl
+                    });
+                    await playlist.save();
+                }
+                playlistIds.push(playlist._id);
+            }
+
+            // Check for existing song to avoid duplicates
+            let existingSong = await Song.findOne({ 
+                url: songData.url,
+                name: songData.title 
+            });
+
+            if (!existingSong) {
+                const newSong = new Song({
+                    name: songData.title,
+                    singer: singer._id,
+                    fileLink,
+                    artwork: artworkUrl,
+                    url: songData.url,
+                    rating: songData.rating || 0,
+                    playlist: playlistIds[0], // Primary playlist
+                    playCount: 0
+                });
+
+                await newSong.save();
+
+                // Add song to all specified playlists
+                await Playlist.updateMany(
+                    { _id: { $in: playlistIds } },
+                    { $addToSet: { songs: newSong._id } }
+                );
+
+                importedSongs.push(newSong);
+            }
+        }
+
+        res.json({
+            message: "Songs imported successfully",
+            count: importedSongs.length,
+            songs: importedSongs
         });
-
-        await newSong.save();
-
-        fs.unlinkSync(req.file.path);
-
-        res.json({ message: "Song added successfully", song: newSong });
     } catch (error) {
-        res.status(500).json({ error: "Error adding song", details: error.message });
+        console.error("Import error:", error);
+        res.status(500).json({
+            error: "Error importing songs",
+            details: error.message
+        });
     }
 });
 
 // Get All Songs
 router.get("/song", async (req, res) => {
     try {
-        const songs = await Song.find().populate("singer playlist");
+        const songs = await Song.find().populate("singer").populate("playlist");
         res.json(songs);
     } catch (err) {
         res.status(500).json({ error: "Error fetching songs", details: err.message });
@@ -102,44 +206,33 @@ router.put("/song/:id", async (req, res) => {
 
 //Delete song
 router.delete("/song/:id", async (req, res) => {
-    const { id } = req.params;
-    await Song.findByIdAndDelete(id);
-    res.json({ message: "Song deleted" });
+    try {
+        const song = await Song.findById(req.params.id);
+        if (!song) return res.status(404).json({ error: "Song not found" });
+
+        // Delete file from Cloudinary
+        if (song.fileLink.includes("res.cloudinary.com")) {
+            const publicId = song.fileLink.split("/").pop().split(".")[0]; // Extract public_id
+            await cloudinary.uploader.destroy(publicId, { resource_type: "video" });
+        }
+
+        await Song.findByIdAndDelete(req.params.id);
+        res.json({ message: "Song deleted successfully" });
+    } catch (error) {
+        res.status(500).json({ error: "Error deleting song", details: error.message });
+    }
 });
 
 // Create Playlist
-router.post("/playlist",upload.single("coverImage"), async (req, res) => {
+
+router.post("/playlist", upload.single("coverImage"), async (req, res) => {
     try {
         const { name, description, songs } = req.body;
+        if (!name || name.trim() === "") return res.status(400).json({ error: "Playlist name is required" });
 
-        if (!name || name.trim() === "") {
-            return res.status(400).json({ error: "Playlist name is required" });
-        }
-
-        let songIds = [];
-        if (songs && Array.isArray(songs)) {
-            for (const songName of songs) {
-                const songDoc = await Song.findOne({ name: songName.trim() });
-                if (songDoc) {
-                    songIds.push(songDoc._id);
-                }
-            }
-        }
-
-        let coverImageUrl = ""
-
-        if (req.file) {
-            const result = await cloudinary.uploader.upload(req.file.path, { folder: "playlists" });
-            coverImageUrl = result.secure_url;  
-            fs.unlinkSync(req.file.path);
-        }
-
-        const newPlaylist = new Playlist({ 
-            name, 
-            description,
-            songs: songIds,
-            coverImage: coverImageUrl 
-        });
+        let coverImageUrl = req.file ? await uploadToCloudinary(req.file.path, "playlists") : "";
+        
+        const newPlaylist = new Playlist({ name, description, songs, coverImage: coverImageUrl });
         await newPlaylist.save();
 
         res.json({ message: "Playlist created", playlist: newPlaylist });
@@ -151,7 +244,7 @@ router.post("/playlist",upload.single("coverImage"), async (req, res) => {
 // Get All Playlist
 router.get("/playlist", async (req, res) => {
     try {
-        const playlists = await Song.find().populate("playlist");
+        const playlists = await Playlist.find().populate({path: "songs", populate: {path: "singer"}});
         res.json(playlists);
     } catch (err) {
         res.status(500).json({ error: "Error fetching songs", details: err.message });
@@ -169,23 +262,31 @@ router.put("/playlist/:id", async (req, res) => {
 
 // Delete Playlist
 router.delete("/playlist/:id", async (req, res) => {
-    const { id } = req.params;
-    await Playlist.findByIdAndDelete(id);
-    res.json({ message: "Playlist deleted" });
+    try {
+        const playlist = await Playlist.findById(req.params.id);
+        if (!playlist) return res.status(404).json({ error: "Playlist not found" });
+
+        // Delete cover image from Cloudinary
+        if (playlist.coverImage.includes("res.cloudinary.com")) {
+            const publicId = playlist.coverImage.split("/").pop().split(".")[0];
+            await cloudinary.uploader.destroy(publicId);
+        }
+
+        await Playlist.findByIdAndDelete(req.params.id);
+        res.json({ message: "Playlist deleted successfully" });
+    } catch (error) {
+        res.status(500).json({ error: "Error deleting playlist", details: error.message });
+    }
 });
 
 // Add Singer
 router.post("/singer", upload.single("picture"), async (req, res) => {
     try {
         const { name, bio } = req.body;
+        if (!req.file) return res.status(400).json({ error: "Picture file is required" });
 
-        if (!req.file) {
-            return res.status(400).json({ error: "Picture file is required" });
-        }
-
-        const result = await cloudinary.uploader.upload(req.file.path, { folder: "singers" });
-
-        const newSinger = new Singer({ name, bio, picture: result.secure_url });
+        const pictureUrl = await uploadToCloudinary(req.file.path, "singers");
+        const newSinger = new Singer({ name, bio, picture: pictureUrl });
         await newSinger.save();
 
         res.json({ message: "Singer added", singer: newSinger });

@@ -1,4 +1,4 @@
 .env
 tmp/
-uploads/
 node_modules
+uploads/

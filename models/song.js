@@ -14,6 +14,16 @@ const songSchema = mongoose.Schema({
     fileLink: {
         type: String
     },
+    artwork: {
+        type: String
+    },
+    url: {
+        type: String
+    },
+    rating: {
+        type: Number,
+        default: 0
+    },
     playlist: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "Playlist"
